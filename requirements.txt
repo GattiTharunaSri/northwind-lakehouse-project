@@ -1,0 +1,7 @@
+﻿faker==30.3.0
+pyspark==3.5.3
+delta-spark==3.2.1
+pytest==8.3.3
+chispa==0.10.1
+databricks-sdk==0.36.0
+python-dotenv==1.0.1
