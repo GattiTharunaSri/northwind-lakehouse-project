@@ -89,12 +89,20 @@ def _deduplicate_orders(df: DataFrame) -> DataFrame:
 
 
 def _validate_orders(df: DataFrame) -> tuple[DataFrame, DataFrame]:
+    """Split orders into (valid, quarantine).
+    
+    Quarantine reasons:
+    - null order_id
+    - null customer_id (orphan)
+    - non-positive total_amount
+    - empty items array
+    - order_date in the future
+    """
     df_with_reason = df.withColumn(
         "_quarantine_reason",
         F.when(F.col("order_id").isNull(), "NULL_ORDER_ID")
          .when(F.col("customer_id").isNull(), "NULL_CUSTOMER_ID")
          .when(F.col("total_amount") <= 0, "NON_POSITIVE_TOTAL")
-         .when(F.col("items").isNull(), "INVALID_ITEMS_JSON")        # NEW
          .when(F.size("items") == 0, "EMPTY_ITEMS")
          .when(F.col("order_date") > F.current_timestamp(), "FUTURE_ORDER_DATE")
          .otherwise(None)
