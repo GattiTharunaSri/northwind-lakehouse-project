@@ -79,54 +79,60 @@ def build_silver_products(
 ) -> str:
     """Build or incrementally update the Silver products table.
     
-    Strategy:
-    - First run: create the table with all transformed Bronze data
-    - Subsequent runs: MERGE only the rows we haven't already processed
-    
-    Uniqueness key: (product_id, last_updated) — we track daily snapshots.
+    Uses a CONDITIONAL merge: only updates rows when business columns actually changed.
+    This produces true idempotent behavior — re-running with no new data = 0 updates.
     """
     bronze_table = f"{catalog}.{bronze_schema}.products_raw"
     silver_table = f"{catalog}.{silver_schema}.{target_table}"
     
     print(f"🔧 Building Silver products: {silver_table}")
     
-    # 1. Ensure target schema
     ensure_silver_schema(spark, catalog, silver_schema)
     
-    # 2. Read Bronze and transform
     bronze_df = spark.table(bronze_table)
     silver_df = transform_products(bronze_df)
     
     print(f"   Bronze rows: {bronze_df.count():,}")
     print(f"   After Silver transform: {silver_df.count():,}")
     
-    # 3. Initial create OR incremental merge
     if not table_exists(spark, silver_table):
-        # First run: create the Silver table
         (silver_df.write
             .format("delta")
             .mode("overwrite")
-            .option("delta.enableChangeDataFeed", "true")  # Useful for downstream Gold
+            .option("delta.enableChangeDataFeed", "true")
             .saveAsTable(silver_table))
         print(f"✅ Created {silver_table} with {silver_df.count():,} rows")
     else:
-        # Subsequent runs: MERGE incremental rows
         silver_df.createOrReplaceTempView("silver_products_staging")
         
+        # Conditional MERGE: only update when business columns differ.
+        # Audit columns (_silver_processed_at, _bronze_*) are intentionally
+        # excluded from the change detection — they always differ but aren't
+        # "real" changes.
         merge_sql = f"""
         MERGE INTO {silver_table} target
         USING silver_products_staging source
             ON  target.product_id = source.product_id
             AND target.last_updated = source.last_updated
-        WHEN MATCHED THEN UPDATE SET *
+        WHEN MATCHED AND (
+            target.product_name      <=> source.product_name      = false OR
+            target.category          <=> source.category          = false OR
+            target.subcategory       <=> source.subcategory       = false OR
+            target.brand             <=> source.brand             = false OR
+            target.price             <=> source.price             = false OR
+            target.cost              <=> source.cost              = false OR
+            target.margin_pct        <=> source.margin_pct        = false OR
+            target.price_band        <=> source.price_band        = false OR
+            target.weight_kg         <=> source.weight_kg         = false OR
+            target.is_active         <=> source.is_active         = false
+        )
+        THEN UPDATE SET *
         WHEN NOT MATCHED THEN INSERT *
         """
         result = spark.sql(merge_sql)
-        # Show the merge metrics — this is what production monitoring uses
         result.show(truncate=False)
         print(f"✅ Merged into {silver_table}")
     
-    # 4. Optimize the table for query performance
     spark.sql(f"OPTIMIZE {silver_table}")
     
     return silver_table
