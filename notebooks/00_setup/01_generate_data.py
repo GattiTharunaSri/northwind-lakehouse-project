@@ -1,22 +1,24 @@
 # Databricks notebook source
 # MAGIC %md
 # MAGIC # Data Generator Runner
-# MAGIC 
+# MAGIC
 # MAGIC Generates simulated data for Day N of the Northwind retail simulation,
 # MAGIC and writes it to the Bronze landing volume in JSON/CSV/Parquet formats.
 
 # COMMAND ----------
+
 # MAGIC %pip install faker==30.3.0
 # MAGIC %restart_python
 
 # COMMAND ----------
+
 import json
 import sys
 from pathlib import Path
 
 # Add the repo's src/ to path — adjust if your repo path differs
 # When using Databricks Repos / Git folders, this should be /Workspace/Repos/<you>/<repo>/src
-REPO_SRC = "/Workspace/Repos/tharuna11072000@gmail.com/northwind-lakehouse-project/src"
+REPO_SRC = "/Workspace/Users/tharuna11072000@gmail.com/northwind-lakehouse-project/src"
 if REPO_SRC not in sys.path:
     sys.path.insert(0, REPO_SRC)
 
@@ -26,8 +28,9 @@ from northwind.generators.customers import generate_customers_snapshot
 from northwind.generators.clickstream import generate_clickstream_batch
 
 # COMMAND ----------
+
 # Parameters — set via Databricks widgets so we can replay any day
-dbutils.widgets.text("day_offset", "0", "Simulation Day Offset")
+dbutils.widgets.text("day_offset", "10", "Simulation Day Offset")
 dbutils.widgets.text("orders_per_batch", "500", "Orders per Batch")
 dbutils.widgets.text("clickstream_per_batch", "2000", "Clickstream Events")
 dbutils.widgets.text("num_batches", "3", "Mini-batches to write")
@@ -43,6 +46,7 @@ BASE_PATH = f"/Volumes/{CATALOG}/northwind_bronze/landing"
 print(f"Generating Day {day_offset} data → {BASE_PATH}")
 
 # COMMAND ----------
+
 # 1. ORDERS — write multiple JSONL files to simulate mini-batches throughout the day
 import uuid
 orders_path = f"{BASE_PATH}/orders"
@@ -59,6 +63,7 @@ for batch_num in range(num_batches):
     print(f"  ✅ Wrote {len(orders)} orders → {file_name}")
 
 # COMMAND ----------
+
 # 2. PRODUCTS — daily CSV snapshot
 import csv
 import io
@@ -76,6 +81,7 @@ dbutils.fs.put(products_path, buffer.getvalue(), overwrite=True)
 print(f"✅ Wrote {len(products)} products → {products_path}")
 
 # COMMAND ----------
+
 # 3. CUSTOMERS — weekly Parquet snapshot (only on day 0, 7, 14, ...)
 if day_offset % 7 == 0:
     customers = generate_customers_snapshot(day_offset=day_offset)
@@ -90,6 +96,7 @@ else:
     print(f"⏭️  Skipping customers (only generated weekly; day {day_offset} is not a snapshot day)")
 
 # COMMAND ----------
+
 # 4. CLICKSTREAM — high-volume JSONL with possible corruption
 clickstream_path = f"{BASE_PATH}/clickstream"
 dbutils.fs.mkdirs(clickstream_path)
@@ -112,6 +119,7 @@ for batch_num in range(num_batches * 2):  # Higher frequency than orders
     print(f"  ✅ Wrote {len(events)} clickstream events → {file_name}")
 
 # COMMAND ----------
+
 # Verify everything landed
 print("\n=== Volume contents ===")
 for sub in ["orders", "products", "customers", "clickstream"]:

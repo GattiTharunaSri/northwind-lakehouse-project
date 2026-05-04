@@ -10,64 +10,43 @@ from __future__ import annotations
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
-from pyspark.sql.types import (
-    DecimalType,
-    StructType, StructField, StringType, DoubleType, IntegerType, ArrayType
-)
+from pyspark.sql.types import DecimalType, StructType, StructField, StringType, ArrayType, IntegerType, DoubleType
 
 from ._utils import ensure_silver_schema, table_exists
 
-
-# ----- Explicit nested schemas -----
-# Defining these explicitly is the production pattern for handling
-# nested JSON that Bronze stored as strings.
-
-SHIPPING_ADDRESS_SCHEMA = StructType([
-    StructField("street",  StringType(), True),
-    StructField("city",    StringType(), True),
-    StructField("state",   StringType(), True),
-    StructField("zip",     StringType(), True),
+# Schema for shipping_address JSON
+shipping_address_schema = StructType([
+    StructField("street", StringType(), True),
+    StructField("city", StringType(), True),
+    StructField("state", StringType(), True),
+    StructField("zip", StringType(), True),
     StructField("country", StringType(), True),
 ])
 
-ITEM_SCHEMA = StructType([
-    StructField("product_id", StringType(),  True),
-    StructField("quantity",   IntegerType(), True),
-    StructField("unit_price", DoubleType(),  True),
-])
-
-ITEMS_ARRAY_SCHEMA = ArrayType(ITEM_SCHEMA)
-
-
-def _maybe_parse_json(df: DataFrame, col_name: str, schema) -> DataFrame:
-    """Parse `col_name` as JSON if it is currently a StringType.
-    
-    Defensive: if the column is already structured, leave it alone.
-    This makes the function work whether Bronze inferred types correctly or not.
-    """
-    current_type = dict(df.dtypes).get(col_name)
-    if current_type == "string":
-        return df.withColumn(col_name, F.from_json(F.col(col_name), schema))
-    return df
+# Schema for items JSON array
+items_schema = ArrayType(StructType([
+    StructField("product_id", StringType(), True),
+    StructField("quantity", IntegerType(), True),
+    StructField("unit_price", DoubleType(), True),
+]))
 
 
 def _flatten_and_clean(bronze_df: DataFrame) -> DataFrame:
-    """Type-cast, parse-json-if-needed, and flatten incoming Bronze orders."""
-    
-    # Step 1: Parse nested fields that came in as JSON strings
-    df = _maybe_parse_json(bronze_df, "shipping_address", SHIPPING_ADDRESS_SCHEMA)
-    df = _maybe_parse_json(df,        "items",            ITEMS_ARRAY_SCHEMA)
-    
-    # Step 2: Type-cast top-level string columns to proper types
-    return (df
+    """Type-cast, flatten, and add a row_hash to incoming Bronze orders."""
+    return (bronze_df
         .withColumn("order_date",   F.to_timestamp("order_date"))
         .withColumn("total_amount", F.col("total_amount").cast(DecimalType(12, 2)))
+        # Parse JSON strings to structured types
+        .withColumn("shipping_address", F.from_json(F.col("shipping_address"), shipping_address_schema))
+        .withColumn("items", F.from_json(F.col("items"), items_schema))
+        # Flatten shipping_address
         .withColumn("ship_street",  F.col("shipping_address.street"))
         .withColumn("ship_city",    F.col("shipping_address.city"))
         .withColumn("ship_state",   F.col("shipping_address.state"))
         .withColumn("ship_zip",     F.col("shipping_address.zip"))
         .withColumn("ship_country", F.col("shipping_address.country"))
-        .withColumn("item_count",   F.size("items"))
+        # Item count derived from the array
+        .withColumn("item_count", F.size("items"))
         .withColumn("_extracted_at", F.to_timestamp("_extracted_at"))
     )
 
@@ -75,8 +54,8 @@ def _flatten_and_clean(bronze_df: DataFrame) -> DataFrame:
 def _deduplicate_orders(df: DataFrame) -> DataFrame:
     """Pick exactly one row per order_id when duplicates exist.
     
-    Tiebreaker: latest _extracted_at, then latest _ingestion_timestamp.
-    Deterministic — re-running on the same data picks the same winner.
+    Tiebreaker: latest _extracted_at wins. If still tied, latest _ingestion_timestamp.
+    This is deterministic — re-running on the same data picks the same winner.
     """
     dedup_window = Window.partitionBy("order_id").orderBy(
         F.desc("_extracted_at"),
@@ -118,15 +97,11 @@ def transform_orders(bronze_df: DataFrame) -> tuple[DataFrame, DataFrame]:
     Returns (valid_orders_df, quarantine_df).
     """
     cleaned = _flatten_and_clean(bronze_df)
-    
-    # Ensure discount_code exists even on pre-day-5 Bronze rows
-    if "discount_code" not in cleaned.columns:
-        cleaned = cleaned.withColumn("discount_code", F.lit(None).cast("string"))
-    
     deduped = _deduplicate_orders(cleaned)
     valid, quarantine = _validate_orders(deduped)
     
-    valid_final = (valid.select(
+    # Final shape for valid orders
+    valid_final = valid.select(
         "order_id",
         "customer_id",
         "order_date",
@@ -139,12 +114,13 @@ def transform_orders(bronze_df: DataFrame) -> tuple[DataFrame, DataFrame]:
         "ship_state",
         "ship_zip",
         "ship_country",
-        "discount_code",
-        "items",
+        # discount_code may not exist on pre-day-5 rows — use safe access
+        F.col("discount_code") if "discount_code" in valid.columns else F.lit(None).alias("discount_code"),
+        "items",  # We'll explode this in the line-items table
         "_extracted_at",
         F.col("_source_file").alias("_bronze_source_file"),
         F.col("_ingestion_timestamp").alias("_bronze_ingested_at"),
-    ).withColumn("_silver_processed_at", F.current_timestamp()))
+    ).withColumn("_silver_processed_at", F.current_timestamp())
     
     return valid_final, quarantine
 
@@ -155,7 +131,10 @@ def build_silver_orders(
     bronze_schema: str = "northwind_bronze",
     silver_schema: str = "northwind_silver",
 ) -> dict[str, str]:
-    """Build the Silver orders fact tables and quarantine table."""
+    """Build the Silver orders fact tables and quarantine table.
+    
+    Returns a dict mapping logical name → full table name.
+    """
     bronze_table     = f"{catalog}.{bronze_schema}.orders_raw"
     fact_orders      = f"{catalog}.{silver_schema}.fact_orders"
     fact_items       = f"{catalog}.{silver_schema}.fact_order_items"
@@ -175,17 +154,21 @@ def build_silver_orders(
     print(f"   Valid (after dedup + validation): {valid_count:,}")
     print(f"   Quarantined: {quarantine_count:,}")
     
+    # Sanity: dedup loss + quarantine loss should reconcile vs Bronze
     distinct_orders = bronze_df.select("order_id").distinct().count()
     print(f"   Distinct order_ids in Bronze: {distinct_orders:,}")
     print(f"   Dedup eliminated: {bronze_count - distinct_orders:,}")
     
-    # ---- fact_orders ----
+    # ---- Write fact_orders ----
     if not table_exists(spark, fact_orders):
+        # Drop the items array — it's going into fact_order_items, not fact_orders
         (valid_df.drop("items").write
             .format("delta")
             .mode("overwrite")
             .option("delta.enableChangeDataFeed", "true")
             .saveAsTable(fact_orders))
+        
+        # Add CHECK constraints AFTER table creation (Delta requires this)
         spark.sql(f"ALTER TABLE {fact_orders} ADD CONSTRAINT positive_total CHECK (total_amount > 0)")
         spark.sql(f"ALTER TABLE {fact_orders} ADD CONSTRAINT non_null_customer CHECK (customer_id IS NOT NULL)")
         spark.sql(f"ALTER TABLE {fact_orders} ADD CONSTRAINT non_empty_items CHECK (item_count > 0)")
@@ -198,11 +181,13 @@ def build_silver_orders(
             ON target.order_id = source.order_id
         WHEN NOT MATCHED THEN INSERT *
         """
+        # Note: orders are append-only — no UPDATE clause
+        # If an order_id is already in Silver, we keep the original version
         result = spark.sql(merge_sql)
         result.show(truncate=False)
         print(f"✅ Merged into {fact_orders}")
     
-    # ---- fact_order_items ----
+    # ---- Write fact_order_items (exploded line items) ----
     items_df = (valid_df
         .select(
             "order_id",
@@ -244,8 +229,9 @@ def build_silver_orders(
         result.show(truncate=False)
         print(f"✅ Merged into {fact_items}")
     
-    # ---- quarantine ----
+    # ---- Write quarantine table ----
     if quarantine_count > 0:
+        # Quarantine is append-only — we keep history of every reject
         quarantine_to_write = (quarantine_df
             .select(
                 "order_id", "customer_id", "order_date", "status",
@@ -266,6 +252,7 @@ def build_silver_orders(
                 .saveAsTable(quarantine_table))
         print(f"⚠️  Quarantined {quarantine_count:,} rows → {quarantine_table}")
     
+    # ---- Optimize ----
     spark.sql(f"OPTIMIZE {fact_orders}")
     spark.sql(f"OPTIMIZE {fact_items}")
     
