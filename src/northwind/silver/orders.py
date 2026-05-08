@@ -246,12 +246,18 @@ def build_silver_orders(
                 .mode("overwrite")
                 .saveAsTable(quarantine_table))
         else:
-            (quarantine_to_write.write
-                .format("delta")
-                .mode("append")
-                .saveAsTable(quarantine_table))
-        print(f"⚠️  Quarantined {quarantine_count:,} rows → {quarantine_table}")
-    
+        # MERGE on (order_id, _quarantine_reason) — same bad row reappearing
+        # in a re-run shouldn't create a duplicate quarantine entry.
+        quarantine_to_write.createOrReplaceTempView("quarantine_staging")
+        spark.sql(f"""
+            MERGE INTO {quarantine_table} target
+            USING quarantine_staging source
+                ON  target.order_id = source.order_id
+                AND target._quarantine_reason = source._quarantine_reason
+            WHEN NOT MATCHED THEN INSERT *
+        """)
+    print(f"⚠️  Quarantined {quarantine_count:,} rows → {quarantine_table}")
+
     # ---- Optimize ----
     spark.sql(f"OPTIMIZE {fact_orders}")
     spark.sql(f"OPTIMIZE {fact_items}")
