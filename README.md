@@ -4,7 +4,7 @@ An end-to-end lakehouse on Databricks (GCP) implementing the medallion architect
 with both **manual PySpark** and **Delta Live Tables**, governed by Unity Catalog,
 orchestrated as a **Databricks Asset Bundle**, and visualized in Databricks SQL.
 
-![Pipeline DAG](docs/images/workflow_dag.png)
+![Pipeline DAG](docs/images/Workflow_DAG.png)
 
 ## What This Project Demonstrates
 
