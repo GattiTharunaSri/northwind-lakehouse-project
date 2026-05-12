@@ -13,7 +13,7 @@ REPO_SRC = "/Workspace/Users/tharuna11072000@gmail.com/northwind-lakehouse-proje
 if REPO_SRC not in sys.path:
     sys.path.insert(0, REPO_SRC)
 
-from northwind.silver.orders import build_silver_orders
+from northwind.silver.orders import build_silver_orders # type: ignore
 
 CATALOG = "dbs_main_catalog"
 
