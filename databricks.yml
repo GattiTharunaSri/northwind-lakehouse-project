@@ -1,0 +1,168 @@
+# databricks.yml — Northwind Lakehouse asset bundle definition
+bundle:
+  name: northwind-lakehouse
+
+# What we're deploying — variables let us swap per environment
+variables:
+  catalog:
+    description: Unity Catalog to deploy resources into
+    default: dbs_main_catalog
+  bronze_schema:
+    default: northwind_bronze
+  silver_schema:
+    default: northwind_silver
+  gold_schema:
+    default: northwind_gold
+  notification_email:
+    description: Email for job failure alerts
+    default: tharuna11072000@gmail.com
+  existing_cluster_id:
+    description: All-purpose cluster ID to run jobs on (dev only)
+    default: "5427-143608-0mbww2fc"
+
+# Deployment targets — different settings per environment
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://8259552725340675.5.gcp.databricks.com/  # <-- update
+  
+  prod:
+    mode: production
+    workspace:
+      host: https://8259562533088359.9.gcp.databricks.com/  # <-- update
+    # In production we want stricter alerting
+    run_as:
+      user_name: tharuna11072000@gmail.com  # <-- or a service principal
+
+# The actual resources to deploy
+resources:
+  jobs:
+    northwind_end_to_end:
+      name: northwind-end-to-end
+      description: "Full lakehouse refresh — Bronze → Silver → Gold → Dashboard"
+      
+      # Alerting on failure
+      email_notifications:
+        on_failure:
+          - ${var.notification_email}
+        on_duration_warning_threshold_exceeded:
+          - ${var.notification_email}
+      
+      # Run on a schedule (daily 2 AM UTC)
+      schedule:
+        quartz_cron_expression: "0 0 2 * * ?"
+        timezone_id: UTC
+        pause_status: PAUSED  # Don't actually run on schedule until you unpause
+      
+      # Max runtime — kill the job if it hangs
+      timeout_seconds: 3600
+      
+      # How many concurrent runs are allowed
+      max_concurrent_runs: 1
+      
+      # Job-level parameters
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: day_offset
+          default: "0"  # For data generation
+      
+      # Shared job cluster definition — all tasks use this
+      
+      
+      # ============================================================
+      # TASK DEFINITIONS
+      # ============================================================
+      tasks:
+        # ---------- Optional: generate fresh data ----------
+        - task_key: generate_data
+          existing_cluster_id: ${var.existing_cluster_id}
+          notebook_task:
+            notebook_path: /Workspace/Users/${workspace.current_user.userName}/northwind-lakehouse-project/notebooks/00_setup/01_generate_data
+            base_parameters:
+              day_offset: "{{job.parameters.day_offset}}"
+          # Optional task — don't fail the whole job if this fails
+          retry_on_timeout: false
+          max_retries: 1
+        
+        # ---------- Bronze: 4 parallel ingestion tasks ----------
+        - task_key: bronze_orders
+          depends_on:
+            - task_key: generate_data
+          existing_cluster_id: ${var.existing_cluster_id}
+          notebook_task:
+            notebook_path: /Workspace/Users/${workspace.current_user.userName}/northwind-lakehouse-project/notebooks/01_bronze/01_ingest_orders
+          max_retries: 2
+          min_retry_interval_millis: 60000
+        
+        - task_key: bronze_products
+          depends_on:
+            - task_key: generate_data
+          existing_cluster_id: ${var.existing_cluster_id}
+          notebook_task:
+            notebook_path: /Workspace/Users/${workspace.current_user.userName}/northwind-lakehouse-project/notebooks/01_bronze/02_ingest_products
+          max_retries: 2
+        
+        - task_key: bronze_customers
+          depends_on:
+            - task_key: generate_data
+          existing_cluster_id: ${var.existing_cluster_id}
+          notebook_task:
+            notebook_path: /Workspace/Users/${workspace.current_user.userName}/northwind-lakehouse-project/notebooks/01_bronze/03_ingest_customers
+          max_retries: 2
+        
+        - task_key: bronze_clickstream
+          depends_on:
+            - task_key: generate_data
+          existing_cluster_id: ${var.existing_cluster_id}
+          notebook_task:
+            notebook_path: /Workspace/Users/${workspace.current_user.userName}/northwind-lakehouse-project/notebooks/01_bronze/04_ingest_clickstream
+          max_retries: 2
+        
+        # ---------- Silver: respects Bronze dependencies ----------
+        - task_key: silver_products
+          depends_on:
+            - task_key: bronze_products
+          existing_cluster_id: ${var.existing_cluster_id}
+          notebook_task:
+            notebook_path: /Workspace/Users/${workspace.current_user.userName}/northwind-lakehouse-project/notebooks/02_silver/01_silver_products
+          max_retries: 1
+        
+        - task_key: silver_customers
+          depends_on:
+            - task_key: bronze_customers
+          existing_cluster_id: ${var.existing_cluster_id}
+          notebook_task:
+            notebook_path: /Workspace/Users/${workspace.current_user.userName}/northwind-lakehouse-project/notebooks/02_silver/02_silver_customers
+          max_retries: 1
+        
+        - task_key: silver_orders
+          # Orders need customers + products to be ready (for fact_sales joins downstream)
+          depends_on:
+            - task_key: bronze_orders
+            - task_key: silver_customers
+            - task_key: silver_products
+          existing_cluster_id: ${var.existing_cluster_id}
+          notebook_task:
+            notebook_path: /Workspace/Users/${workspace.current_user.userName}/northwind-lakehouse-project/notebooks/02_silver/03_silver_orders
+          max_retries: 1
+        
+        # ---------- Gold: builds the star schema and aggregates ----------
+        - task_key: gold_build_all
+          depends_on:
+            - task_key: silver_orders  # Orders is the last Silver dependency
+          existing_cluster_id: ${var.existing_cluster_id}
+          notebook_task:
+            notebook_path: /Workspace/Users/${workspace.current_user.userName}/northwind-lakehouse-project/notebooks/03_gold/04_run_all_gold
+          max_retries: 1
+        
+        # ---------- Final data quality checks ----------
+        - task_key: data_quality_audit
+          depends_on:
+            - task_key: gold_build_all
+          existing_cluster_id: ${var.existing_cluster_id}
+          notebook_task:
+            notebook_path: /Workspace/Users/${workspace.current_user.userName}/northwind-lakehouse-project/notebooks/05_orchestration/dq_audit
+          max_retries: 0  # DQ should not retry — investigate failures
